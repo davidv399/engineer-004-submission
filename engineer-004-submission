@@ -1,0 +1,151 @@
+# Engineer 004 Submission: Real-Time Analytics Pipeline
+
+## Executive recommendation
+
+I would solve this with a two-tier AWS design that emphasizes correctness and operational simplicity over raw novelty. The system would ingest events through a compatibility endpoint, land them in a durable stream, and then fan out to a hot real-time service for personalization and a long-term warehouse path for analytics. I would choose managed services aggressively because the team is small, the deadline is tight, and the current system is already failing under burst traffic.
+
+## 1. Architecture and technology choices
+
+### Proposed architecture
+
+```mermaid
+flowchart LR
+    SDK[JavaScript SDK<br/>unchanged] --> EDGE[ALB + API Gateway]
+    EDGE --> KAFKA[MSK / Kinesis]
+    KAFKA --> PROC[Stream processing workers]
+    PROC --> HOT[(Redis + DynamoDB)]
+    PROC --> SEARCH[(OpenSearch)]
+    PROC --> RAW[(S3 raw bucket)]
+    RAW --> WAREHOUSE[Snowflake / BigQuery]
+    HOT --> PERS[Personalization engine]
+    SEARCH --> DASH[Dashboards]
+    PROC --> DLQ[Dead-letter queue]
+```
+
+### Why this design
+
+- I would keep the existing SDK untouched and add an ingestion layer that accepts the same payloads. That avoids a customer-visible break and lowers migration risk.
+- I would use Amazon Kinesis or MSK as the stream backbone because both provide replay and scaling, but Kinesis is the more pragmatic MVP choice on AWS for a small team.
+- The hot path would use Redis for recent state and DynamoDB for durable lookups because this is a better fit for low-latency personalization than trying to query a warehouse in real time.
+- I would use S3 as the system of record for raw events and warehouse exports because it is cost-effective, durable, and easy to replay from.
+- I would favor a simpler transformation path in the MVP and a more sophisticated processing layer later rather than over-architecting for unknown future requirements.
+
+### Event schema and identity model
+
+I would standardize on a schema-versioned event contract:
+
+- tenant_id
+- event_id
+- event_type
+- ts
+- anonymous_id
+- user_id
+- session_id
+- context_json
+- properties_json
+- source
+- schema_version
+
+Identity stitching would be handled by a conservative ruleset:
+
+1. Use anonymous_id as the primary join key for all events.
+2. When a known user_id arrives, update the identity map and rehydrate the associated historical events in the hot store.
+3. Keep a canonical user identifier per tenant and maintain a deletion tombstone for GDPR requests.
+4. Write both the raw identity and the resolved identity into the event record so audits remain possible.
+
+This is less ambitious than behavior-based identity inference, but it is more reliable and easier to explain to customers and auditors.
+
+## 2. Scale, reliability, and migration
+
+### Handling 50M+ events/day and 10x spikes
+
+The brief states a workload of 50M events/day. I would model the system around the following figures:
+
+- [Observed] 50,000,000 events/day
+- [Estimated] 578.7 events/second on average
+- [Estimated] 5,787 events/second at a 10x spike
+- [Assumed] 1.0 KB average payload size
+- [Estimated] 48 GB/day of raw event data
+
+To keep the system reliable, I would use a write-ahead approach where the ingestion service acknowledges an event only after it has been durably accepted by the stream and archived to S3. I would size the stream with enough headroom for burst traffic and add autoscaling policies to increase consumer capacity quickly. I would also introduce a dead-letter queue and replay path so a malformed event or downstream failure does not cause silent data loss.
+
+### Migration and rollback
+
+I would migrate with staged rollout by tenant:
+
+1. Stand up the new ingestion endpoint in parallel with the existing pipeline.
+2. Mirror a subset of traffic to the new path and compare event counts and user counts.
+3. Enable dual-write for the highest-value tenants and keep the legacy pipeline as the fallback.
+4. Shift the dashboard and personalization reads to the new path gradually.
+5. Keep rollback controls at the edge so traffic can be redirected back to the old stack quickly if metrics deviate.
+
+This reduces customer impact and keeps the migration reversible.
+
+### Data accuracy validation
+
+I would validate correctness using three checks:
+
+- Count parity between the new and old systems for sampled tenants.
+- Schema validation on all incoming events and alerting on drift.
+- Replay tests from S3 to make sure downstream aggregates remain consistent.
+
+## 3. Trade-offs and risks
+
+### What I am optimizing for
+
+This version optimizes for operational safety, simplicity, and migration speed. It favors a conservative architecture that can be built by a small team and safely rolled out to customers without a breaking change.
+
+### What I am sacrificing
+
+- I would not optimize for ultra-low-latency complex joins in the MVP.
+- I would not attempt full exactly-once semantics at first.
+- I would keep the warehouse model simpler than a fully normalized analytics stack.
+
+### Risks and failure modes
+
+- If the identity map diverges, personalization and segmentation will become inaccurate.
+- If schema changes happen without a migration plan, consumers may break silently.
+- If the compatibility endpoint becomes overloaded during a spike, it could become the bottleneck.
+- If deletion requests are not applied consistently, the system would violate compliance requirements.
+
+### What I would do with more time or budget
+
+With more budget, I would add a more sophisticated stream processor, a stronger quality framework, and a richer real-time feature store. With more time, I would invest in better tenant isolation and more detailed replay tooling.
+
+## Evidence log
+
+| Claim | Evidence type | Why it is credible |
+|---|---|---|
+| The architecture can handle the stated event volume and spikes | Tier 2 | The companion sizing artifact models the reported throughput and storage requirements. |
+| The migration plan preserves existing integrations | Tier 2 | The design keeps the SDK contract intact and uses staged dual-write and rollback controls. |
+| The approach fits the team and timeline | Tier 2 | The plan relies on managed AWS services and a straightforward MVP implementation. |
+
+## Number source labels
+
+- [Observed] 50,000,000 events/day from the brief.
+- [Estimated] 578.7 events/second on average from the stated daily volume.
+- [Estimated] 5,787 events/second at a 10x burst.
+- [Assumed] 1.0 KB average payload size for sizing.
+- [Estimated] 48 GB/day of raw event data from the assumed payload size.
+
+## AI usage disclosure
+
+- Tool used: GitHub Copilot Chat.
+- What it helped with: drafting a second architecture variant, tightening the migration story, and creating a distinct tradeoff framing.
+- What I changed: I selected a different emphasis around operational safety and rollout simplicity.
+- What I checked myself: I reviewed the structure, the numbers, and the migration sequence for consistency with the brief.
+
+## What breaks this plan
+
+This plan would fail if the team underestimated burst traffic, if the compatibility endpoint became the bottleneck, or if GDPR deletion logic was incomplete. It would also degrade quickly if schema updates were not versioned and rolled out carefully.
+
+## What stays human
+
+The following decisions should remain human-led:
+
+- Customer migration sequencing and communication.
+- Privacy and retention policy choices.
+- Rollback decisions during production incidents.
+- Prioritization of which segments and personalization signals matter most.
+
+These choices require product judgment and operational accountability rather than automation alone.
